@@ -211,7 +211,7 @@ def main():
 
 	with dpg.window(label="About", tag="about_window", show=False, modal=True, width=400, height=200):
 		dpg.add_text("Sky AutoMusic PC", color=(0, 255, 0))
-		dpg.add_text("Version 1.0.1")
+		dpg.add_text("Version 1.0.2")
 		dpg.add_text("Author: killey_")
 		# dpg.add_button(label="Report Issues on Github", callback=lambda:webbrowser.open("https://github.com/redtardis12/Sky-AutoMusic-PC"))
 
