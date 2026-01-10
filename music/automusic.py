@@ -1,13 +1,13 @@
 import concurrent.futures
 import json
 import time
+import threading
 import keyboard
 import pydirectinput
 pydirectinput.PAUSE = 0
 import pygetwindow as gw
 import chardet
 import orjson
-from multiprocessing import Value, Manager
 
 def json_default(obj):
 	if isinstance(obj, datetime.datetime):
@@ -39,7 +39,7 @@ class PrettyJSONEncoder(json.JSONEncoder):
 		curr_indent = indent * level
 		next_indent = indent * (level + 1)
 		if isinstance(obj, (list, tuple)):
-			if all(not isinstance(x, (tuple, list, dict)) for x in obj):
+			if all(not isinstance(x, (tuple, list, dict)) or len(json_dumps(x)) < 10 for x in obj):
 				return "[" + ", ".join(json_dumpstr(x) for x in obj) + "]"
 			items = [self.encode(x, level=level + 1) for x in obj]
 			return "[\n" + next_indent + f",\n{next_indent}".join(item for item in items) + f"\n{curr_indent}" + "]"
@@ -57,32 +57,30 @@ class PrettyJSONEncoder(json.JSONEncoder):
 prettyjsonencoder = PrettyJSONEncoder(indent="\t")
 pretty_json = lambda obj: prettyjsonencoder.encode(obj)
 
-def convert_to_utf8(input_file, output_file):
-	"""
-	Convert a JSON file from any encoding to UTF-8.
-	
-	Args:
-	input_file (str): Path to the input JSON file.
-	output_file (str): Path to the output JSON file.
-	"""
 
-	with open(input_file, 'rb') as file:
-		raw_data = file.read()
-	
-	detected_encoding = chardet.detect(raw_data)['encoding']
-	if detected_encoding == 'UTF-8':
-		return
+def read_json_file(file_path):
+	with open(file_path, "rb") as f:
+		b = f.read()
+	try:
+		return orjson.loads(b)
+	except orjson.JSONDecodeError:
+		raise ValueError(f"Invalid JSON file: {file_path}. If this was a MIDI file, please check out https://github.com/thomas-xin/hyperchoron for conversion!")
 
-	decoded_data = raw_data.decode(detected_encoding)
+def load_song(file_path):
+	data = read_json_file(file_path)
+	if isinstance(data, dict):
+		data = [data]
+	return data
 
-	json_data = json.loads(decoded_data)
-
-	b = pretty_json(json_data)
-	with open(output_file, "w", encoding="utf-8") as f:
-		f.write(b)
-
+def save_song(data, file_path):
+	s = pretty_json(data)
+	with open(file_path, "w", encoding="utf-8") as f:
+		f.write(s)
+	return file_path
 
 def produce_songnotes(song):
+	if not song.get("columns"):
+		return
 	output = []
 	bpm_ms = 60000 / song["bpm"]
 	timestamp = 100
@@ -104,48 +102,44 @@ class MusicHandler:
 	data = None
 	config = None
 
-	def __init__(self, file_path, max_notes, curr_note, config):
+	def __init__(self, file_path, config):
 		self.file_path = file_path
 		self.config = config
-		self.data = self.read_json_file(file_path)
-
-		if isinstance(self.data, dict):
-			self.data = [self.data]
-		if not self.data[0].get("songNotes"):
+		self.data = load_song(file_path)
+		if self.data[0].get("columns"):
 			produce_songnotes(self.data[0])
+		self.curr_note = 0
+		self.max_note = 1
 
+		self.start_key, self.stop_key = self.get_hotkeys()
+		keyboard.add_hotkey(self.stop_key, lambda: self.pause())
+		self.running = threading.Thread(target=self.run, daemon=True)
+		self.running.start()
+
+	def run(self):
 		notes = self.data[0]['songNotes']
 		bpm = self.data[0]['bpm']
-		self.start_key, self.stop_key = self.get_hotkeys()
-
-		keyboard.add_hotkey(self.stop_key, lambda: self.pause())
 		while not self.exitProgram:
 			keyboard.wait(self.start_key)
 			self.pauseProgram = False
-			time.sleep(2)
 			if gw.getActiveWindowTitle().split(None, 1)[0] == 'Sky':
-				self.simulate_keyboard_presses(notes, bpm, max_notes, curr_note)
+				self.simulate_keyboard_presses(notes, bpm)
 
 	def get_hotkeys(self):
 		keys = self.config.read_config()["music"]
 		return keys["start_key"]["scan_code"], keys["stop_key"]["scan_code"]
 
-	def read_json_file(self, file_path):
-		convert_to_utf8(self.file_path, self.file_path)
-		with open(file_path, "rb") as f:
-			b = f.read()
-		try:
-			return orjson.loads(b)
-		except orjson.JSONDecodeError:
-			raise ValueError(f"Invalid JSON file: {file_path}. Probably wrong encoding, please make sure that your file is in UTF-8.")
+	def is_alive(self):
+		return not self.exitProgram
 
 	def quit(self):
-		self.exitProgram=True
+		self.exitProgram = True
+		self.running.join()
 
 	def pause(self):
 		self.pauseProgram = True
 
-	def simulate_keyboard_presses(self, notes, bpm, max_notes, curr_note):
+	def simulate_keyboard_presses(self, notes, bpm):
 		print("Starting playback...")
 		key_mapping = self.config.read_config()["music"]["key_mapping"]
 
@@ -161,28 +155,32 @@ class MusicHandler:
 
 		start_time = time.time()
 
-		max_notes.value = round(max(notes_dict))
-		curr_note.value = 0
+		self.max_note = round(max(notes_dict))
+		self.curr_note = 0
 
-		def callback(func, *args, **kwargs):
+		def press(k):
+			pydirectinput.keyUp(k)
+			return pydirectinput.keyDown(k)
+		def callback(k):
 			time.sleep(0.04)
-			return func(*args, **kwargs)
+			return pydirectinput.keyUp(k)
 
 		with concurrent.futures.ThreadPoolExecutor(max_workers=64) as exc:
 			for note in notes:
-				if self.pauseProgram: break
 				next_time = note[0] + start_time
 				delay = next_time - time.time()
 				if delay > 0:
 					time.sleep(delay)
 
+				if self.pauseProgram or self.exitProgram:
+					break
+
 				print(note)
 				key_to_press = note[1]
 				for k in key_to_press:
-					pydirectinput.keyUp(k)
-					pydirectinput.keyDown(k)
-					exc.submit(callback, pydirectinput.keyUp, k)
-				curr_note.value = round(note[0])
+					exc.submit(press, k)
+					exc.submit(callback, k)
+				self.curr_note = round(note[0])
 
-def mstart(file, max_notes, curr_note, config):
-	ms = MusicHandler(file, max_notes, curr_note, config)
+def mstart(file, config):
+	return MusicHandler(file, config)

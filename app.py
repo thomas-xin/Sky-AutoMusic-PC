@@ -1,12 +1,12 @@
 import os
 import shutil
-import multiprocessing
 import time
-from music.automusic import mstart
+from music.automusic import mstart, pretty_json, produce_songnotes, load_song, save_song
 from config import ConfigHandler
 import dearpygui.dearpygui as dpg
 import threading
 import json
+import orjson
 import sys
 
 music_proc = None
@@ -14,6 +14,8 @@ selected_song = None
 config = ConfigHandler("config.json")
 music_folder = config.read_config()["app"]["music_dir"]
 music_folder = music_folder if music_folder else "music/songs/"
+
+SUPPORTED = ("txt", "json", "skysheet", "genshinsheet", "mid", "midi")
 
 def resource_path(relative_path):
 	try:
@@ -31,7 +33,7 @@ def get_music_files():
 				return []
 		radio_list = []
 		for midi_file in os.listdir(music_folder):
-			if midi_file.rsplit(".", 1)[-1] in ("txt", "json", "skysheet"):
+			if midi_file.rsplit(".", 1)[-1] in SUPPORTED:
 				radio_list.append(midi_file)
 		return radio_list
 	except:
@@ -40,8 +42,7 @@ def get_music_files():
 def stop_hotkeys():
 	global music_proc
 	if music_proc:
-		music_proc.terminate()
-		music_proc.join()
+		music_proc.quit()
 		music_proc = None
 		print("Stopped music")
 
@@ -63,15 +64,12 @@ def copy_music(sender, app_data, user_data):
 
 # Manages the music playback process by starting or stopping it based on the current state
 def music_hotkeys():
-	global music_proc, selected_song, m, c, bar_thread
+	global music_proc, selected_song, bar_thread
 	if not selected_song:
 		return
 	if not music_proc:
 		f = os.path.join(music_folder, selected_song)
-		m = multiprocessing.Value('i', 1)
-		c = multiprocessing.Value('i', 0)
-		music_proc = multiprocessing.Process(target=mstart, args=(f,m,c, config))
-		music_proc.start()
+		music_proc = mstart(f, config)
 		dpg.set_item_label("play_btn", "Stop")
 		print("Started music")
 		bar_thread = threading.Thread(target=update_progress_bar, args=(), daemon=True)
@@ -79,13 +77,12 @@ def music_hotkeys():
 	else:
 		stop_hotkeys()
 		dpg.set_item_label("play_btn", "Start")
-		m = multiprocessing.Value('i', 1)
-		c = multiprocessing.Value('i', 0)
 		print("Stopped music")
 
 
 def restart_hotkeys(sender, app_data, user_data):
 	global music_proc, selected_song
+	dpg.configure_item("radio_btn", items=get_music_files())
 	selected_song = app_data
 	show_current_music_speed()
 	print(f"Selected: {selected_song}")
@@ -94,9 +91,13 @@ def restart_hotkeys(sender, app_data, user_data):
 		music_hotkeys()
 
 def update_progress_bar():
-	while c.value < m.value and m.value > 0 and music_proc.is_alive():
-		progress = c.value / m.value
-		dpg.set_value("progress_bar", min(progress, 1.0))
+	last_progress = 0
+	while music_proc.is_alive():
+		progress = music_proc.curr_note / music_proc.max_note
+		if progress != last_progress:
+			last_progress = progress
+			dpg.set_value("progress_bar", min(progress, 1.0))
+		time.sleep(1 / 60)
 	dpg.set_value("progress_bar", 0)
 
 
@@ -104,18 +105,18 @@ def show_current_music_speed():
 	if not selected_song:
 		dpg.set_value("speed_slider", 0)
 		return
-	with open(os.path.join(music_folder, selected_song), 'r') as file:
-		data = json.load(file)
-		dpg.set_value("speed_slider", data[0]["bpm"])
+	file_path = os.path.join(music_folder, selected_song)
+	data = load_song(file_path)
+	dpg.set_value("speed_slider", data[0]["bpm"])
 
 def change_current_music_speed(sender, app_data, user_data):
 	if not selected_song:
 		return
-	with open(os.path.join(music_folder, selected_song), 'r') as file:
-		data = json.load(file)
-		data[0]["bpm"] = dpg.get_value("speed_slider")
-	with open(os.path.join(music_folder, selected_song), 'w') as file:
-		json.dump(data, file)
+	file_path = os.path.join(music_folder, selected_song)
+	data = load_song(file_path)
+	data[0]["bpm"] = dpg.get_value("speed_slider")
+	produce_songnotes(data[0])
+	save_song(data, file_path)
 	dpg.configure_item("modal_id", show=False)
 	restart_hotkeys(sender, selected_song, user_data)
 
@@ -177,7 +178,7 @@ def main():
 
 			with dpg.popup(dpg.last_item(), mousebutton=dpg.mvMouseButton_Left, modal=True, tag="modal_id"):
 				dpg.add_text("Change current music speed (Press Ctrl + LMB to input manually)")
-				dpg.add_slider_int(label="", min_value=1, max_value=800, default_value=1, tag="speed_slider", no_input=False)
+				dpg.add_slider_int(label="", min_value=1, max_value=1600, default_value=1, tag="speed_slider", no_input=False)
 				dpg.add_button(label="Save", callback=change_current_music_speed)
 
 	with dpg.window(label="How to use?", tag="howto_window", show=False, modal=True, width=750, height=400):
@@ -196,7 +197,7 @@ def main():
 
 	with dpg.window(label="About", tag="about_window", show=False, modal=True, width=400, height=200):
 		dpg.add_text("Sky AutoMusic PC", color=(0, 255, 0))
-		dpg.add_text("Version 1.0.0")
+		dpg.add_text("Version 1.0.1")
 		dpg.add_text("Author: killey_")
 		# dpg.add_button(label="Report Issues on Github", callback=lambda:webbrowser.open("https://github.com/redtardis12/Sky-AutoMusic-PC"))
 
@@ -215,11 +216,13 @@ def main():
 			for key in config.read_config()["music"]["key_mapping"].keys():
 				with dpg.group(horizontal=True):
 					dpg.add_text(f"Note {key}: ")
-					dpg.add_button(label=f"{config.read_config()['music']['key_mapping'][key]}",
-									callback=update_hotkeys_binds,
-									user_data=f"{key}",
-									indent=100,
-									width=100)
+					dpg.add_button(
+						label=f"{config.read_config()['music']['key_mapping'][key]}",
+						callback=update_hotkeys_binds,
+						user_data=f"{key}",
+						indent=100,
+						width=100,
+					)
 
 		dpg.add_separator()
 
@@ -241,8 +244,8 @@ def main():
 
 
 	with dpg.file_dialog(directory_selector=False, show=False, callback=copy_music, tag="file_picker", width=700, height=400):
-		dpg.add_file_extension(".txt")
-		dpg.add_file_extension(".json")
+		for fmt in SUPPORTED:
+			dpg.add_file_extension(fmt)
 
 
 	# Resize the child window to leave 90px for the bottom bar
@@ -308,5 +311,4 @@ def apply_dark_purple_theme():
 
 
 if __name__ == "__main__":
-	multiprocessing.freeze_support()
 	main()
