@@ -1,7 +1,7 @@
 import os
 import shutil
 import time
-from music.automusic import mstart, pretty_json, produce_songnotes, load_song, save_song
+from music.automusic import mstart, pretty_json, produce_songnotes, load_song, save_song, SUPPORTED
 from config import ConfigHandler
 import dearpygui.dearpygui as dpg
 import threading
@@ -14,8 +14,6 @@ selected_song = None
 config = ConfigHandler("config.json")
 music_folder = config.read_config()["app"]["music_dir"]
 music_folder = music_folder if music_folder else "music/songs/"
-
-SUPPORTED = ("txt", "json", "skysheet", "genshinsheet", "mid", "midi")
 
 def resource_path(relative_path):
 	try:
@@ -45,6 +43,7 @@ def stop_hotkeys():
 		music_proc.quit()
 		music_proc = None
 		print("Stopped music")
+		dpg.set_item_label("play_btn", "Start")
 
 def copy_music(sender, app_data, user_data):
 	if not app_data['selections']:
@@ -77,7 +76,6 @@ def music_hotkeys():
 	else:
 		stop_hotkeys()
 		dpg.set_item_label("play_btn", "Start")
-		print("Stopped music")
 
 
 def restart_hotkeys(sender, app_data, user_data):
@@ -91,14 +89,17 @@ def restart_hotkeys(sender, app_data, user_data):
 		music_hotkeys()
 
 def update_progress_bar():
+	global music_proc
 	last_progress = 0
-	while music_proc.is_alive():
+	while music_proc and music_proc.is_alive():
 		progress = music_proc.curr_note / music_proc.max_note
 		if progress != last_progress:
 			last_progress = progress
 			dpg.set_value("progress_bar", min(progress, 1.0))
 		time.sleep(1 / 60)
 	dpg.set_value("progress_bar", 0)
+	music_proc = None
+	dpg.set_item_label("play_btn", "Start")
 
 
 def show_current_music_speed():
@@ -106,18 +107,26 @@ def show_current_music_speed():
 		dpg.set_value("speed_slider", 0)
 		return
 	file_path = os.path.join(music_folder, selected_song)
-	data = load_song(file_path)
+	try:
+		data = load_song(file_path)
+	except Exception:
+		dpg.set_value("speed_slider", 0)
+		return
 	dpg.set_value("speed_slider", data[0]["bpm"])
 
 def change_current_music_speed(sender, app_data, user_data):
+	global selected_song
 	if not selected_song:
 		return
 	file_path = os.path.join(music_folder, selected_song)
 	data = load_song(file_path)
 	data[0]["bpm"] = dpg.get_value("speed_slider")
 	produce_songnotes(data[0])
+	if not file_path.endswith(".skysheet"):
+		file_path = file_path.rsplit(".", 1)[0] + ".skysheet"
 	save_song(data, file_path)
 	dpg.configure_item("modal_id", show=False)
+	selected_song = file_path.replace("\\", "/").rsplit("/", 1)[-1]
 	restart_hotkeys(sender, selected_song, user_data)
 
 def update_hotkeys_binds(sender, app_data, user_data):
@@ -148,6 +157,7 @@ def update_always_on_top(sender, app_data, user_data):
 	config.set_always_on_top(app_data)
 
 def main():
+	global selected_song
 	dpg.create_context()
 	apply_dark_purple_theme()
 	dpg.create_viewport(title='Sky AutoMusic PC', width=800, height=600, always_on_top=config.read_config()["app"]["always_on_top"])
@@ -180,6 +190,10 @@ def main():
 				dpg.add_text("Change current music speed (Press Ctrl + LMB to input manually)")
 				dpg.add_slider_int(label="", min_value=1, max_value=1600, default_value=1, tag="speed_slider", no_input=False)
 				dpg.add_button(label="Save", callback=change_current_music_speed)
+
+		if radio_list:
+			selected_song = radio_list[0]
+			show_current_music_speed()
 
 	with dpg.window(label="How to use?", tag="howto_window", show=False, modal=True, width=750, height=400):
 		dpg.add_text("How to use:", color=(0, 255, 0))
