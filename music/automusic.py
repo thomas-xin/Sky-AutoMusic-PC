@@ -102,7 +102,17 @@ def save_song(data, file_path):
 
 def produce_songnotes(song):
 	if not song.get("columns"):
-		return
+		if not song.get("bpm"):
+			return
+		bpm_ms = 60000 / song["bpm"]
+		columns = []
+		for note in song["songNotes"]:
+			ts = round(note["time"] / bpm_ms)
+			while len(columns) <= ts:
+				columns.append([1, []])
+			col = columns[ts]
+			col[1].append([int(note["key"].rsplit("Key", 1)[-1]), hex(1 << note.get("l", 1) - 1)[2:].upper()])
+		song["columns"] = columns
 	output = []
 	bpm_ms = 60000 / song["bpm"]
 	timestamp = 100
